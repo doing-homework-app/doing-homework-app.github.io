@@ -787,7 +787,26 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f0f7f4;min-height:100vh;c
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script>
+// ════════════════════════════════════════════
+// Firebase 초기화
+// ════════════════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyBDHh3GL8hGfLkrbkbTWyuicHr5y3yVh5s",
+  authDomain: "doing-homework.firebaseapp.com",
+  databaseURL: "https://doing-homework-default-rtdb.firebaseio.com",
+  projectId: "doing-homework",
+  storageBucket: "doing-homework.firebasestorage.app",
+  messagingSenderId: "607833608103",
+  appId: "1:607833608103:web:f5e53a3fd9acf5a7af3082",
+  measurementId: "G-SXFEW15CYF"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+let fbReady = true;
+
 // ════════════════════════════════════════════
 // 상수
 // ════════════════════════════════════════════
@@ -847,9 +866,24 @@ function genFamilyCode(){
 }
 
 function getProfiles(){try{return JSON.parse(localStorage.getItem('qb_profiles'))||[];}catch(e){return[];}}
-function saveProfiles(p){localStorage.setItem('qb_profiles',JSON.stringify(p));}
+function saveProfiles(p){
+  localStorage.setItem('qb_profiles',JSON.stringify(p));
+  if(fbReady){
+    const byFamily={};
+    p.forEach(pr=>{
+      if(!byFamily[pr.familyCode])byFamily[pr.familyCode]={};
+      byFamily[pr.familyCode][pr.id]=pr;
+    });
+    Object.keys(byFamily).forEach(fc=>{
+      db.ref('profiles/'+fc).set(byFamily[fc]).catch(e=>console.warn('FB profiles save error',e));
+    });
+  }
+}
 function getFamilies(){try{return JSON.parse(localStorage.getItem('qb_families'))||{};}catch(e){return {};}}
-function saveFamilies(f){localStorage.setItem('qb_families',JSON.stringify(f));}
+function saveFamilies(f){
+  localStorage.setItem('qb_families',JSON.stringify(f));
+  if(fbReady) db.ref('families').set(f).catch(e=>console.warn('FB families save error',e));
+}
 function getCurrent(){return localStorage.getItem('qb_current')||'';}
 function setCurrent(id){localStorage.setItem('qb_current',id);}
 
@@ -863,7 +897,19 @@ function getProfileData(profileId){
   }catch(e){}
   return {totalStars:0,done:{},monthStars:{},wishes:[],monthendSeen:{},tasks:JSON.parse(JSON.stringify(DEFAULT_TASKS))};
 }
-function saveProfileData(profileId,data){localStorage.setItem('qb_data_'+profileId,JSON.stringify(data));}
+function saveProfileData(profileId,data){
+  localStorage.setItem('qb_data_'+profileId,JSON.stringify(data));
+  if(fbReady){
+    let fc=currentProfile?currentProfile.familyCode:null;
+    if(!fc){
+      const p=getProfiles().find(x=>x.id===profileId);
+      if(p)fc=p.familyCode;
+    }
+    if(fc){
+      db.ref('data/'+fc+'/'+profileId).set(data).catch(e=>console.warn('FB data save error',e));
+    }
+  }
+}
 
 // 기존 qb_v1 데이터 마이그레이션
 function migrateOldData(){
@@ -932,6 +978,71 @@ function showToast(msg){
 function save(){if(currentProfile&&state)saveProfileData(currentProfile.id,state);}
 
 // ════════════════════════════════════════════
+// Firebase 실시간 동기화
+// ════════════════════════════════════════════
+let _familySyncRef=null, _profilesSyncRef=null, _dataSyncRef=null;
+
+function initFirebaseSync(){
+  // Listen to families for real-time sync
+  db.ref('families').on('value', snap=>{
+    const val=snap.val();
+    if(val){
+      localStorage.setItem('qb_families',JSON.stringify(val));
+      // If on auth screen, refresh it
+      if(document.getElementById('auth-screen').classList.contains('active')){
+        renderAuth();
+      }
+    }
+  });
+
+  // If logged in, listen to family data
+  if(currentProfile){
+    startFamilySync(currentProfile.familyCode);
+  }
+}
+
+function startFamilySync(familyCode){
+  // Detach previous listeners if any
+  if(_profilesSyncRef){_profilesSyncRef.off();_profilesSyncRef=null;}
+  if(_dataSyncRef){_dataSyncRef.off();_dataSyncRef=null;}
+
+  // Listen to profiles in this family
+  _profilesSyncRef=db.ref('profiles/'+familyCode);
+  _profilesSyncRef.on('value', snap=>{
+    const val=snap.val();
+    if(val){
+      let profiles=getProfiles();
+      const fbProfiles=Object.values(val);
+      fbProfiles.forEach(fbp=>{
+        const idx=profiles.findIndex(p=>p.id===fbp.id);
+        if(idx>=0) profiles[idx]=fbp;
+        else profiles.push(fbp);
+      });
+      localStorage.setItem('qb_profiles',JSON.stringify(profiles));
+    }
+  });
+
+  // Listen to all data in this family
+  _dataSyncRef=db.ref('data/'+familyCode);
+  _dataSyncRef.on('value', snap=>{
+    const val=snap.val();
+    if(val){
+      Object.keys(val).forEach(pid=>{
+        localStorage.setItem('qb_data_'+pid,JSON.stringify(val[pid]));
+      });
+      // If we're logged in and viewing, refresh the display
+      if(currentProfile && state){
+        const freshData=getProfileData(currentProfile.id);
+        state=freshData;
+        if(document.getElementById('app').classList.contains('active')){
+          renderAll();
+        }
+      }
+    }
+  });
+}
+
+// ════════════════════════════════════════════
 // AUTH 화면
 // ════════════════════════════════════════════
 function renderAuth(){
@@ -972,6 +1083,7 @@ function loginProfile(id){
   const p=profiles.find(x=>x.id===id);
   if(!p)return;
   currentProfile=p;
+  startFamilySync(p.familyCode);
   state=getProfileData(id);
   setCurrent(id);
   setAC({hex:p.color,light:p.colorLight});
@@ -983,9 +1095,14 @@ function loginProfile(id){
 function deleteProfile(id){
   if(!confirm('이 프로필을 삭제할까요?'))return;
   let profiles=getProfiles();
+  const delProfile=profiles.find(p=>p.id===id);
   profiles=profiles.filter(p=>p.id!==id);
   saveProfiles(profiles);
   localStorage.removeItem('qb_data_'+id);
+  if(fbReady && delProfile){
+    db.ref('profiles/'+delProfile.familyCode+'/'+id).remove().catch(e=>console.warn('FB profile delete error',e));
+    db.ref('data/'+delProfile.familyCode+'/'+id).remove().catch(e=>console.warn('FB data delete error',e));
+  }
   if(getCurrent()===id)setCurrent('');
   renderAuth();
 }
@@ -1107,46 +1224,90 @@ function completeRegistration(){
   const profiles=getProfiles();
   const families=getFamilies();
   const id=genId();
-  let familyCode='';
 
   if(famMode==='create'){
     const famName=document.getElementById('fam-name').value.trim();
     if(!famName)return;
-    familyCode=genFamilyCode();
-    // 중복 방지
+    let familyCode=genFamilyCode();
     while(families[familyCode])familyCode=genFamilyCode();
     families[familyCode]={name:famName,createdBy:id,createdAt:Date.now()};
-  }else{
-    familyCode=document.getElementById('fam-join-code').value.trim().toUpperCase();
-    if(!families[familyCode]){
-      document.getElementById('fam-join-error').style.display='block';
-      return;
-    }
-  }
 
-  const profile={id,familyCode,role:regRole,name,avatar:regAv,color:regCol.hex,colorLight:regCol.light,pin};
-  profiles.push(profile);
-  saveProfiles(profiles);
-  saveFamilies(families);
+    const profile={id,familyCode,role:regRole,name,avatar:regAv,color:regCol.hex,colorLight:regCol.light,pin};
+    profiles.push(profile);
+    saveProfiles(profiles);
+    saveFamilies(families);
 
-  // 프로필 데이터 초기화
-  const data={totalStars:0,done:{},monthStars:{},wishes:[],monthendSeen:{},tasks:JSON.parse(JSON.stringify(DEFAULT_TASKS))};
-  saveProfileData(id,data);
+    const data={totalStars:0,done:{},monthStars:{},wishes:[],monthendSeen:{},tasks:JSON.parse(JSON.stringify(DEFAULT_TASKS))};
+    saveProfileData(id,data);
 
-  // 로그인
-  currentProfile=profile;
-  state=data;
-  setCurrent(id);
-  setAC(regCol);
-  curDay=todayIdx();viewMonth=curMon();
-
-  // 가족 생성 시 코드 보여주기
-  if(famMode==='create'){
+    currentProfile=profile;
+    state=data;
+    setCurrent(id);
+    setAC(regCol);
+    startFamilySync(familyCode);
+    curDay=todayIdx();viewMonth=curMon();
     showScreen('app');renderAll();
     setTimeout(()=>{showToast('가족 코드: '+familyCode+' 📋');},500);
   }else{
-    showScreen('app');renderAll();
-    setTimeout(()=>{showToast('가족에 참여했어요! 🎉');},500);
+    // Join flow: check Firebase first, then fall back to localStorage
+    const familyCode=document.getElementById('fam-join-code').value.trim().toUpperCase();
+    if(!familyCode)return;
+
+    // Check Firebase for the family code
+    db.ref('families/'+familyCode).once('value').then(snap=>{
+      const fbFamily=snap.val();
+      const localFamilies=getFamilies();
+
+      if(!fbFamily && !localFamilies[familyCode]){
+        document.getElementById('fam-join-error').style.display='block';
+        return;
+      }
+
+      // If found in Firebase but not local, add to local
+      if(fbFamily && !localFamilies[familyCode]){
+        localFamilies[familyCode]=fbFamily;
+        localStorage.setItem('qb_families',JSON.stringify(localFamilies));
+      }
+
+      const profile={id,familyCode,role:regRole,name,avatar:regAv,color:regCol.hex,colorLight:regCol.light,pin};
+      const currentProfiles=getProfiles();
+      currentProfiles.push(profile);
+      saveProfiles(currentProfiles);
+
+      const data={totalStars:0,done:{},monthStars:{},wishes:[],monthendSeen:{},tasks:JSON.parse(JSON.stringify(DEFAULT_TASKS))};
+      saveProfileData(id,data);
+
+      currentProfile=profile;
+      state=data;
+      setCurrent(id);
+      setAC(regCol);
+      startFamilySync(familyCode);
+      curDay=todayIdx();viewMonth=curMon();
+      showScreen('app');renderAll();
+      setTimeout(()=>{showToast('가족에 참여했어요! 🎉');},500);
+    }).catch(e=>{
+      console.warn('FB family lookup error',e);
+      // Fallback to localStorage
+      if(!families[familyCode]){
+        document.getElementById('fam-join-error').style.display='block';
+        return;
+      }
+      const profile={id,familyCode,role:regRole,name,avatar:regAv,color:regCol.hex,colorLight:regCol.light,pin};
+      profiles.push(profile);
+      saveProfiles(profiles);
+
+      const data={totalStars:0,done:{},monthStars:{},wishes:[],monthendSeen:{},tasks:JSON.parse(JSON.stringify(DEFAULT_TASKS))};
+      saveProfileData(id,data);
+
+      currentProfile=profile;
+      state=data;
+      setCurrent(id);
+      setAC(regCol);
+      startFamilySync(familyCode);
+      curDay=todayIdx();viewMonth=curMon();
+      showScreen('app');renderAll();
+      setTimeout(()=>{showToast('가족에 참여했어요! 🎉');},500);
+    });
   }
 }
 
@@ -1982,6 +2143,7 @@ function launchConfetti(count){
 // INIT
 // ════════════════════════════════════════════
 migrateOldData();
+initFirebaseSync();
 
 const currentId=getCurrent();
 const profiles=getProfiles();
